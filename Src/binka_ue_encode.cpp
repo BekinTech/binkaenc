@@ -509,7 +509,7 @@ uint8_t UECompressBinkAudioEx(
 
     U32 EncoderFlags;
     if (Format == BINKA_FORMAT_1FCB)
-        EncoderFlags = BINKACNEWFORMAT;   // 1: binka1 (8-bit scalefactor, inline signs)
+        EncoderFlags = 1;                 // 1: binka1 (8-bit scalefactor, inline signs) - previously BINKACNEWFORMAT
     else
         EncoderFlags = BINKAC20;          // 4: binka2 (7-bit scalefactor, grouped signs)
 

@@ -29,7 +29,7 @@ typedef struct BINKAUDIOCOMP * HBINKAUDIOCOMP;
 typedef void* BinkAudioCompressAllocFnType(UINTa ByteCount);
 typedef void BinkAudioCompressFreeFnType(void* Ptr);
 
-#define BINKACNEWFORMAT 1
+//#define BINKACNEWFORMAT 1
 #define BINKAC20 4 // if set, BINKACNEWFORMAT is assumed
 
 RADDEFFUNC HBINKAUDIOCOMP RADLINK BinkAudioCompressOpen(U32 rate,U32 chans, U32 flags, BinkAudioCompressAllocFnType* memalloc, BinkAudioCompressFreeFnType* memfree);

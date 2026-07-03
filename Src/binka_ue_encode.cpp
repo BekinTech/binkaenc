@@ -191,10 +191,19 @@ struct FPStateScope
 // ============================================================
 // Shared compression core
 // ============================================================
-struct CompressResult
+struct AudioChunk
 {
     MemBuffer DataBuffer;
     SeekTableBuffer SeekTable;
+    U32 SeekOffsetInSamples;
+    U32 LastFrameLocation;
+};
+
+struct CompressResult
+{
+    AudioChunk* Chunks;
+    U32 NumChunks;
+    U32 MaxChunks;
     S32 MaxBlockSize;
     U8 NumBinkStreams;
     char* SourceStreams[MAX_STREAMS];
@@ -280,16 +289,21 @@ static uint8_t CompressBlocks(
         Result->hBink[i] = hBink[i];
     }
 
-    Result->DataBuffer = {};
-    Result->DataBuffer.memalloc = MemAlloc;
-    Result->DataBuffer.memfree = MemFree;
-    Result->SeekTable = {};
-    Result->SeekTable.buffer.memalloc = MemAlloc;
-    Result->SeekTable.buffer.memfree = MemFree;
+    Result->MaxChunks = 16;
+    Result->NumChunks = 1;
+    Result->Chunks = (AudioChunk*)MemAlloc(Result->MaxChunks * sizeof(AudioChunk));
+    memset(Result->Chunks, 0, Result->MaxChunks * sizeof(AudioChunk));
+    Result->Chunks[0].DataBuffer.memalloc = MemAlloc;
+    Result->Chunks[0].DataBuffer.memfree = MemFree;
+    Result->Chunks[0].SeekTable.buffer.memalloc = MemAlloc;
+    Result->Chunks[0].SeekTable.buffer.memfree = MemFree;
+    Result->Chunks[0].SeekOffsetInSamples = 0;
+    Result->Chunks[0].LastFrameLocation = 0;
+    
     Result->MaxBlockSize = 0;
     Result->NumBinkStreams = NumBinkStreams;
 
-    U32 LastFrameLocation = 0;
+    U32 CurrentSeekOffset = 0;
 
     // Compression loop
     for (;;)
@@ -339,31 +353,64 @@ static uint8_t CompressBlocks(
         for (S32 i = 0; i < NumBinkStreams; i++)
             TotalBytesUsedForBlock += OutputLens[i];
 
+        U32 BlockHeaderSize = (LimitedToSamples == ~0U) ? 4 : 8;
+        U32 SamplesThisFrame = InputUseds[0] / (ChannelsPerStream[0] * sizeof(S16));
+
+        AudioChunk* CurChunk = &Result->Chunks[Result->NumChunks - 1];
+        U32 NextDataBytes = CurChunk->DataBuffer.total_bytes + BlockHeaderSize + TotalBytesUsedForBlock;
+        U32 NextSeekBytes = (CurChunk->SeekTable.total_count + 1) * sizeof(U16);
+        U32 NextChunkSize = 15 + NextSeekBytes + NextDataBytes;
+
+        if (NextChunkSize > 262144)
+        {
+            if (Result->NumChunks == Result->MaxChunks)
+            {
+                U32 NewMax = Result->MaxChunks * 2;
+                AudioChunk* NewChunks = (AudioChunk*)MemAlloc(NewMax * sizeof(AudioChunk));
+                memset(NewChunks, 0, NewMax * sizeof(AudioChunk));
+                for(U32 c = 0; c < Result->NumChunks; ++c)
+                    NewChunks[c] = Result->Chunks[c];
+                MemFree(Result->Chunks);
+                Result->Chunks = NewChunks;
+                Result->MaxChunks = NewMax;
+            }
+            CurChunk = &Result->Chunks[Result->NumChunks];
+            CurChunk->DataBuffer.memalloc = MemAlloc;
+            CurChunk->DataBuffer.memfree = MemFree;
+            CurChunk->SeekTable.buffer.memalloc = MemAlloc;
+            CurChunk->SeekTable.buffer.memfree = MemFree;
+            CurChunk->SeekOffsetInSamples = CurrentSeekOffset;
+            CurChunk->LastFrameLocation = 0;
+            Result->NumChunks++;
+        }
+
         // Write block header (0x9999 sync, same for both formats)
         if (LimitedToSamples == ~0U)
         {
             U32 BlockHeader = (TotalBytesUsedForBlock << 16) | BLOCK_HEADER_MAGIC;
-            MemBufferAdd(&Result->DataBuffer, &BlockHeader, 4);
+            MemBufferAdd(&CurChunk->DataBuffer, &BlockHeader, 4);
         }
         else
         {
             U32 BlockHeader = 0xffff0000 | BLOCK_HEADER_MAGIC;
-            MemBufferAdd(&Result->DataBuffer, &BlockHeader, 4);
+            MemBufferAdd(&CurChunk->DataBuffer, &BlockHeader, 4);
             U32 LimitHeader = (LimitedToSamples << 16) | TotalBytesUsedForBlock;
-            MemBufferAdd(&Result->DataBuffer, &LimitHeader, 4);
+            MemBufferAdd(&CurChunk->DataBuffer, &LimitHeader, 4);
         }
 
         for (S32 i = 0; i < NumBinkStreams; i++)
-            MemBufferAdd(&Result->DataBuffer, OutputBuffers[i], OutputLens[i]);
+            MemBufferAdd(&CurChunk->DataBuffer, OutputBuffers[i], OutputLens[i]);
 
         if (TotalBytesUsedForBlock > Result->MaxBlockSize)
             Result->MaxBlockSize = TotalBytesUsedForBlock;
 
         if (GenerateSeekTable)
         {
-            SeekTableBufferAdd(&Result->SeekTable, (U16)(Result->DataBuffer.total_bytes - LastFrameLocation));
-            LastFrameLocation = Result->DataBuffer.total_bytes;
+            SeekTableBufferAdd(&CurChunk->SeekTable, (U16)(CurChunk->DataBuffer.total_bytes - CurChunk->LastFrameLocation));
+            CurChunk->LastFrameLocation = CurChunk->DataBuffer.total_bytes;
         }
+
+        CurrentSeekOffset += SamplesThisFrame;
 
         if (AllDone)
             break;
@@ -374,8 +421,16 @@ static uint8_t CompressBlocks(
 
 static void CleanupCompress(CompressResult* Result, BAUECompressFreeFnType* MemFree)
 {
-    MemBufferFree(&Result->DataBuffer);
-    SeekTableBufferFree(&Result->SeekTable);
+    if (Result->Chunks)
+    {
+        for (U32 c = 0; c < Result->NumChunks; ++c)
+        {
+            MemBufferFree(&Result->Chunks[c].DataBuffer);
+            SeekTableBufferFree(&Result->Chunks[c].SeekTable);
+        }
+        MemFree(Result->Chunks);
+        Result->Chunks = NULL;
+    }
     for (S32 i = 0; i < Result->NumBinkStreams; i++)
     {
         MemFree(Result->SourceStreams[i]);
@@ -395,12 +450,27 @@ static uint8_t WriteABEUHeader(
     U32 FramesPerEntry = 1;
     if (GenerateSeekTable)
     {
-        FramesPerEntry = SeekTableBufferTrim(&Result->SeekTable, SeekTableMaxEntries);
-        if (FramesPerEntry == ~0U)
+        for (U32 c = 0; c < Result->NumChunks; ++c)
         {
-            CleanupCompress(Result, MemFree);
-            return BINKA_COMPRESS_ERROR_SIZE;
+            FramesPerEntry = SeekTableBufferTrim(&Result->Chunks[c].SeekTable, SeekTableMaxEntries);
+            if (FramesPerEntry == ~0U)
+            {
+                CleanupCompress(Result, MemFree);
+                return BINKA_COMPRESS_ERROR_SIZE;
+            }
         }
+    }
+
+    uint32_t TotalOutputSize = sizeof(BinkAudioFileHeader);
+    for (U32 c = 0; c < Result->NumChunks; ++c)
+    {
+        AudioChunk* CurChunk = &Result->Chunks[c];
+        uint32_t SeekChunkHeaderSize = 0;
+        if (GenerateSeekTable && CurChunk->SeekTable.total_count > 0 && CurChunk->SeekTable.collapsed)
+        {
+            SeekChunkHeaderSize = 15 + CurChunk->SeekTable.total_count * sizeof(U16);
+        }
+        TotalOutputSize += SeekChunkHeaderSize + CurChunk->DataBuffer.total_bytes;
     }
 
     BinkAudioFileHeader Header;
@@ -413,15 +483,42 @@ static uint8_t WriteABEUHeader(
     Header.max_comp_space_needed = (U16)Result->MaxBlockSize;
     Header.flags = 1;
     Header.version = 1;
-    Header.output_file_size = Result->DataBuffer.total_bytes + sizeof(BinkAudioFileHeader) + Result->SeekTable.total_count * sizeof(U16);
+    Header.output_file_size = TotalOutputSize;
     Header.blocks_per_seek_table_entry = (U16)FramesPerEntry;
-    Header.seek_table_entry_count = (U16)Result->SeekTable.total_count;
+    Header.seek_table_entry_count = 0; // The seek table is now inside the SEEK chunk
 
     char* Output = (char*)MemAlloc(Header.output_file_size);
-    memcpy(Output, &Header, sizeof(BinkAudioFileHeader));
-    if (Result->SeekTable.total_count > 0 && Result->SeekTable.collapsed)
-        memcpy(Output + sizeof(BinkAudioFileHeader), Result->SeekTable.collapsed, Result->SeekTable.total_count * sizeof(U16));
-    MemBufferWriteBuffer(&Result->DataBuffer, Output + sizeof(BinkAudioFileHeader) + Result->SeekTable.total_count * sizeof(U16));
+    char* Cursor = Output;
+
+    memcpy(Cursor, &Header, sizeof(BinkAudioFileHeader));
+    Cursor += sizeof(BinkAudioFileHeader);
+
+    for (U32 c = 0; c < Result->NumChunks; ++c)
+    {
+        AudioChunk* CurChunk = &Result->Chunks[c];
+        uint32_t SeekChunkHeaderSize = 0;
+        if (GenerateSeekTable && CurChunk->SeekTable.total_count > 0 && CurChunk->SeekTable.collapsed)
+        {
+            SeekChunkHeaderSize = 15 + CurChunk->SeekTable.total_count * sizeof(U16);
+        }
+
+        if (SeekChunkHeaderSize > 0)
+        {
+            memcpy(Cursor, "SEEK", 4);
+            Cursor[4] = 0x00;
+            Cursor[5] = 0x80;
+            Cursor[6] = 0x07;
+            *(uint32_t*)(Cursor + 7) = CurChunk->SeekOffsetInSamples;
+            *(uint32_t*)(Cursor + 11) = CurChunk->SeekTable.total_count;
+            Cursor += 15;
+
+            memcpy(Cursor, CurChunk->SeekTable.collapsed, CurChunk->SeekTable.total_count * sizeof(U16));
+            Cursor += CurChunk->SeekTable.total_count * sizeof(U16);
+        }
+
+        MemBufferWriteBuffer(&CurChunk->DataBuffer, Cursor);
+        Cursor += CurChunk->DataBuffer.total_bytes;
+    }
 
     *OutData = Output;
     *OutDataLen = Header.output_file_size;
@@ -442,38 +539,65 @@ static uint8_t Write1FCBHeader(
     U32 FramesPerEntry = 1;
     if (GenerateSeekTable)
     {
-        FramesPerEntry = SeekTableBufferTrim(&Result->SeekTable, SeekTableMaxEntries);
-        if (FramesPerEntry == ~0U)
+        for (U32 c = 0; c < Result->NumChunks; ++c)
         {
-            CleanupCompress(Result, MemFree);
-            return BINKA_COMPRESS_ERROR_SIZE;
+            FramesPerEntry = SeekTableBufferTrim(&Result->Chunks[c].SeekTable, SeekTableMaxEntries);
+            if (FramesPerEntry == ~0U)
+            {
+                CleanupCompress(Result, MemFree);
+                return BINKA_COMPRESS_ERROR_SIZE;
+            }
         }
+    }
+
+    U32 TotalSeekEntries = 0;
+    U32 TotalDataBytes = 0;
+    for (U32 c = 0; c < Result->NumChunks; ++c)
+    {
+        TotalSeekEntries += Result->Chunks[c].SeekTable.total_count;
+        TotalDataBytes += Result->Chunks[c].DataBuffer.total_bytes;
     }
 
     BCF1FileHeader Header;
     memset(&Header, 0, sizeof(Header));
     memcpy(Header.magic, "1FCB", 4);
     Header.version = 2;
-    Header.channels = WavChannels;
+    Header.channels = (U8)WavChannels;
     Header.sample_rate = (uint16_t)WavRate;
     Header.num_samples = SamplesPerChannel;
     Header.max_block_size = (uint32_t)Result->MaxBlockSize;
-    Header.seek_entries = (uint16_t)Result->SeekTable.total_count;
+    Header.seek_entries = (uint16_t)TotalSeekEntries;
     Header.seek_granularity = (uint16_t)FramesPerEntry;
 
-    uint32_t header_size = (uint32_t)sizeof(BCF1FileHeader);
-    uint32_t seek_table_size = Result->SeekTable.total_count * sizeof(U16);
-    uint32_t total_file_size = header_size + seek_table_size + Result->DataBuffer.total_bytes;
+    uint32_t total_file_size = TotalDataBytes + sizeof(BCF1FileHeader) + TotalSeekEntries * sizeof(U16);
     Header.file_size = total_file_size;
 
     char* Output = (char*)MemAlloc(total_file_size);
-    memcpy(Output, &Header, header_size);
-    if (Result->SeekTable.total_count > 0 && Result->SeekTable.collapsed)
-        memcpy(Output + header_size, Result->SeekTable.collapsed, seek_table_size);
-    MemBufferWriteBuffer(&Result->DataBuffer, Output + header_size + seek_table_size);
+    char* Cursor = Output;
+
+    memcpy(Cursor, &Header, sizeof(BCF1FileHeader));
+    Cursor += sizeof(BCF1FileHeader);
+
+    if (TotalSeekEntries > 0)
+    {
+        for (U32 c = 0; c < Result->NumChunks; ++c)
+        {
+            if (Result->Chunks[c].SeekTable.total_count > 0 && Result->Chunks[c].SeekTable.collapsed)
+            {
+                memcpy(Cursor, Result->Chunks[c].SeekTable.collapsed, Result->Chunks[c].SeekTable.total_count * sizeof(U16));
+                Cursor += Result->Chunks[c].SeekTable.total_count * sizeof(U16);
+            }
+        }
+    }
+
+    for (U32 c = 0; c < Result->NumChunks; ++c)
+    {
+        MemBufferWriteBuffer(&Result->Chunks[c].DataBuffer, Cursor);
+        Cursor += Result->Chunks[c].DataBuffer.total_bytes;
+    }
 
     *OutData = Output;
-    *OutDataLen = total_file_size;
+    *OutDataLen = Header.file_size;
 
     CleanupCompress(Result, MemFree);
     return BINKA_COMPRESS_SUCCESS;
